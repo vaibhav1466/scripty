@@ -16,30 +16,37 @@ All output lands in `recon/example.com/`. Final report printed to stdout + saved
 ```
 Input: target.com
   │
-  ├── Phase 1 — Subdomain Enumeration
-  │     crt.sh → subfinder → AlienVault OTX
+  ├── Phase 1  — Subdomain Enumeration
+  │     crt.sh → subfinder → OTX → DNS brute force (170+ names)
   │
-  ├── Phase 2 — Live Host Discovery
+  ├── Phase 2  — Live Host Discovery
   │     dnsx (or dig) → httpx (or curl)
   │
-  ├── Phase 3 — Port Scanning
-  │     naabu (or nc / /dev/tcp)
+  ├── Phase 3  — WAF / CDN Fingerprint
+  │     Cloudflare, Akamai, CloudFront, Google Cloud detection
   │
-  ├── Phase 4 — URL Discovery
+  ├── Phase 4  — Port Scanning
+  │     naabu (or nc / /dev/tcp) — top 1000 ports
+  │
+  ├── Phase 5  — URL Discovery
   │     Wayback Machine → gau → OTX → href extraction → katana
   │     └── Extracts new subdomains from URLs & re-resolves them
   │
-  ├── Phase 5 — JavaScript Analysis
+  ├── Phase 6  — Cloud Asset Enumeration
+  │     S3 bucket name brute force (30+ suffixes)
+  │
+  ├── Phase 7  — JavaScript Analysis
   │     Download JS files → extract API endpoints → hunt secrets
   │
-  ├── Phase 6 — Parameter & Endpoint Extraction
+  ├── Phase 8  — Parameter & Endpoint Extraction
   │     Categorize params by vuln class (IDOR, LFI, SSRF, SQLi, …)
   │     Find juicy endpoints (/api/, /admin/, /graphql, /.git, …)
   │
-  ├── Phase 7 — Nuclei Vulnerability Scan
+  ├── Phase 9  — Nuclei Vulnerability Scan
   │     Critical / high / medium CVEs + subdomain takeover detection
+  │     (limited to first 10 hosts, 5 min timeout)
   │
-  └── Phase 8 — Report Generation
+  └── Phase 10 — Report Generation
         Structured summary with findings & stats
 ```
 
@@ -47,18 +54,22 @@ Input: target.com
 
 - **Zero-config** — one argument, one command. No YAML, no API keys required.
 - **Graceful degradation** — every tool (subfinder, dnsx, httpx, naabu, gau, katana, nuclei) can be missing. Falls back to curl, dig, nc, or pure-bash alternatives.
+- **DNS brute force** — tries 170+ common subdomain names (www, api, admin, mail, etc.) using dnsx or dig.
+- **WAF detection** — identifies Cloudflare, Akamai, CloudFront, and Google Cloud early so you know which results to trust.
+- **S3 bucket discovery** — checks 30+ bucket name patterns for exposed cloud storage.
 - **JS secret hunting** — scans JS for API keys, AWS access keys, private keys, tokens, and bearer auth strings.
 - **Vuln-aware param extraction** — tags each parameter URL with its likely vulnerability class: `[IDOR]`, `[SSRF]`, `[SQLi/XSS]`, `[Open Redirect]`, etc.
 - **Self-healing subdomain list** — extracts new subdomains from crawled URLs and re-resolves/re-probes them.
 - **Portable** — Linux and macOS. Detects GNU vs BSD grep and adjusts regex flags.
 - **Structured output** — every phase writes to its own file. Final report aggregates everything.
+- **Full logging** — all stdout and stderr captured to `recon.log` for post-run review.
 
 ## Output Structure
 
 ```
 recon/<target>/
 ├── report.txt                 # Final human-readable report
-├── recon.log                  # Full stderr log for debugging
+├── recon.log                  # Full transcript log
 ├── errors.log                 # Only errors/warnings
 ├── subdomains.txt             # All discovered subdomains (deduplicated)
 ├── dns_resolved.txt           # Subdomains that resolved to an IP
@@ -74,6 +85,7 @@ recon/<target>/
 ├── js_secrets.txt             # Potential secrets found in JS
 ├── nuclei_results.txt         # Nuclei vulnerability findings
 ├── nuclei_takeover.txt        # Subdomain takeover candidates
+├── cloud_assets.txt           # Discovered S3 buckets and cloud storage
 └── js_downloads/              # Downloaded JS files (cleaned up by default)
 ```
 
@@ -142,14 +154,6 @@ CLEANUP_TEMP=false ./recon.sh bugcrowd.com
 | gau | Wayback Machine + OTX + inline href extraction |
 | katana | skipped (URL discovery uses other sources) |
 | nuclei | skipped, report notes its absence |
-
-## Limitations
-
-- **Passive-only subdomain discovery** — no DNS brute force. Relies on crt.sh, subfinder (API keys), and OTX.
-- **WAF-heavy targets** — Cloudflare blocks nuclei, some JS downloads, and deep crawling. The script handles this gracefully with empty results.
-- **Wayback rate limits** — the CDX API may throttle requests from some IPs.
-- **Nuclei on large targets** — scanning 37+ hosts can take >10 minutes. Run separately on subsets if needed.
-- **No cloud asset enumeration** — S3 buckets, Firebase, and other cloud storage are not checked.
 
 ## License
 

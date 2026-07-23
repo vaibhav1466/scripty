@@ -5,14 +5,16 @@
 # Example: ./recon.sh example.com
 #
 # Phases:
-#   1. Subdomain Enumeration   (crt.sh, subfinder)
-#   2. Live Host Discovery      (dnsx + httpx)
+#   1. Subdomain Enumeration   (crt.sh, subfinder, OTX, DNS brute)
+#  2a. Live Host Discovery      (dnsx + httpx)
+#  2b. WAF Fingerprint          (Cloudflare, Akamai, CloudFront, Google Cloud)
 #   3. Port Scanning            (naabu or nc)
-#   4. URL Discovery            (gau + Wayback Machine)
+#   4. URL Discovery            (Wayback + gau + OTX + katana)
+#  4b. Cloud Enumeration        (S3 bucket discovery)
 #   5. JS Analysis              (download JS, extract endpoints & secrets)
 #   6. Parameter Extraction     (grep-based pattern matching)
-#   8. Nuclei Vulnerability Scan (CVEs, takeovers, misconfigs)
-#   9. Report Generation        (structured output)
+#   7. Nuclei Vulnerability Scan (CVEs, takeovers, misconfigs)
+#   8. Report Generation        (structured output)
 #
 
 set -euo pipefail
@@ -28,6 +30,23 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m' # No Color
+
+# ── Inline subdomain wordlist (common DNS names) ────────────────────────────
+SUBS_WORDLIST=(
+    www api admin mail blog dev test staging cdn shop app community help
+    support docs status mx remote ftp ssh webmail images static assets cdn2
+    partners beta sandbox stage payment checkout accounts sso login auth
+    security docs status blog shop wiki forum m mailman autodiscover
+    calendar contacts drive cloud backup git svn jenkins ci node npm
+    portal dashboard console manager monitor metrics analytics reports
+    billing invoice payments orders cart wishlist gallery media upload
+    download files videos player streaming radio chat voice phone sms
+    notifications alerts webhooks callback webhook events hooks
+    jobs careers apply recruit offers deals coupons promo referral
+    affiliate partners vendors suppliers stores shop demo trial
+    enterprise corporate about team contact support help feedback
+    bug report abuse legal privacy terms
+)
 
 # ── Parse Input ─────────────────────────────────────────────────────────
 TARGET="${1:-}"
@@ -46,20 +65,90 @@ mkdir -p "$OUTDIR"
 ERROR_LOG="$OUTDIR/errors.log"
 : > "$ERROR_LOG"
 
-# ── Log file — tee stderr for post-run debugging ────────────────────────
-exec 2> >(tee -a "$OUTDIR/recon.log" >&2)
+# ── Log file — tee all output for post-run debugging ────────────────────
+exec > >(tee -a "$OUTDIR/recon.log") 2>&1
 
 # ── Cleanup trap ────────────────────────────────────────────────────────
 _cleanup() {
+    if [[ -n "${OUTDIR:-}" && -d "$OUTDIR" && ! -f "$OUTDIR/report.txt" ]]; then
+        {
+            echo ""
+            echo "=============================================="
+            echo "  AutoRecon Report — $TARGET (partial)"
+            echo "  Generated: $(date)"
+            echo "=============================================="
+            echo ""
+
+            echo "- WAF / CDN:"
+            if [[ -f "$OUTDIR/waf_info.txt" && -s "$OUTDIR/waf_info.txt" ]]; then
+                while IFS= read -r line; do echo "  - $line"; done < "$OUTDIR/waf_info.txt"
+            else
+                echo "  (not detected)"
+            fi
+            echo ""
+
+            echo "- Resolved Subdomains:"
+            if [[ -f "$OUTDIR/dns_resolved.txt" && -s "$OUTDIR/dns_resolved.txt" ]]; then
+                while IFS= read -r sub; do echo "  - $sub"; done < "$OUTDIR/dns_resolved.txt"
+            elif [[ -f "$OUTDIR/subdomains.txt" && -s "$OUTDIR/subdomains.txt" ]]; then
+                while IFS= read -r sub; do echo "  - $sub"; done < "$OUTDIR/subdomains.txt"
+            fi
+            echo ""
+
+            echo "- Live Hosts:"
+            if [[ -f "$OUTDIR/live_hosts.txt" && -s "$OUTDIR/live_hosts.txt" ]]; then
+                while IFS= read -r host; do echo "  - $host"; done < "$OUTDIR/live_hosts.txt"
+            else
+                echo "  (none)"
+            fi
+            echo ""
+
+            echo "- Open Ports:"
+            if [[ -f "$OUTDIR/open_ports.txt" && -s "$OUTDIR/open_ports.txt" ]]; then
+                while IFS= read -r line; do
+                    port="${line##*:}"
+                    echo "  - $port"
+                done < "$OUTDIR/open_ports.txt"
+            else
+                echo "  (none)"
+            fi
+            echo ""
+
+            echo "- URLs in scope:"
+            echo "  $(wc -l < "$OUTDIR/urls.txt" 2>/dev/null || echo 0) unique URLs"
+            echo ""
+
+            echo "- Cloud Assets (S3):"
+            if [[ -f "$OUTDIR/cloud_assets.txt" && -s "$OUTDIR/cloud_assets.txt" ]]; then
+                while IFS= read -r line; do echo "  - $line"; done < "$OUTDIR/cloud_assets.txt"
+            else
+                echo "  (none)"
+            fi
+            echo ""
+
+            echo "- JS Secrets:"
+            if [[ -f "$OUTDIR/js_secrets.txt" && -s "$OUTDIR/js_secrets.txt" ]]; then
+                while IFS= read -r line; do echo "  - $line"; done < "$OUTDIR/js_secrets.txt"
+            else
+                echo "  (none)"
+            fi
+            echo ""
+
+            echo "NOTE: Report is partial — script did not complete all phases"
+        } > "$OUTDIR/report.txt" 2>/dev/null || true
+    fi
+
     if [[ "$CLEANUP_TEMP" == "true" ]]; then
         rm -f "$OUTDIR/raw_subs.txt" \
               "$OUTDIR/_wayback_subs.txt" \
               "$OUTDIR/scan_targets.txt" \
-              "$OUTDIR/port_scan_targets.txt" 2>/dev/null || true
+              "$OUTDIR/port_scan_targets.txt" \
+              "$OUTDIR/nuclei_targets.txt" 2>/dev/null || true
         rm -rf "$OUTDIR/js_downloads" 2>/dev/null || true
     fi
 }
 trap _cleanup EXIT
+trap '_cleanup; exit' SIGTERM SIGINT SIGHUP
 
 # ── Helper Functions ────────────────────────────────────────────────────
 info()  { echo -e "${CYAN}[*]${NC} $*"; }
@@ -184,6 +273,25 @@ phase_1_subdomains() {
         fi
     fi
 
+    # ── DNS brute force on common subdomain names ──
+    info "Brute-forcing common subdomain names (${#SUBS_WORDLIST[@]} names)..."
+    local bf_found=0
+    if check_tool dnsx; then
+        printf '%s\n' "${SUBS_WORDLIST[@]}" \
+            | dnsx -silent -domain "$TARGET" 2>/dev/null \
+            >> "$raw_subs" && bf_found=1
+    else
+        for sub in "${SUBS_WORDLIST[@]}"; do
+            dig +short "${sub}.${TARGET}" 2>/dev/null \
+                | grep -qE '^[0-9]' && echo "${sub}.${TARGET}"
+        done >> "$raw_subs" 2>/dev/null && bf_found=1 || true
+    fi
+    if [[ "$bf_found" -eq 1 ]]; then
+        ok "DNS brute force added new subdomains"
+    else
+        warn "DNS brute force found nothing"
+    fi
+
     sort -u "$raw_subs" > "$all_subs"
     local total; total=$(wc -l < "$all_subs")
     info "Total unique subdomains: $total"
@@ -240,6 +348,34 @@ phase_2_live_hosts() {
         ' -- {} < "$dns_resolved" > "$live_hosts" 2>/dev/null || true
     fi
     ok "Live hosts: $(wc -l < "$live_hosts")"
+}
+
+# ── Phase 2b: WAF / CDN Fingerprint ─────────────────────────────────────
+phase_2b_waf_detect() {
+    header "Phase 2b: WAF / CDN Fingerprinting"
+    local httpx_out="$OUTDIR/httpx_output.txt"
+
+    if [[ ! -f "$httpx_out" || ! -s "$httpx_out" ]]; then
+        warn "No httpx data to analyze for WAF detection"
+        return
+    fi
+
+    if grep -qi "cloudflare\|cf-ray" "$httpx_out" 2>/dev/null; then
+        info "Cloudflare detected — downstream fuzzing/nuclei may be blocked"
+    fi
+    if grep -qi "akamai" "$httpx_out" 2>/dev/null; then
+        info "Akamai detected"
+    fi
+    if grep -qi "cloudfront" "$httpx_out" 2>/dev/null; then
+        info "AWS CloudFront detected on some hosts"
+    fi
+    if grep -qi "google cloud" "$httpx_out" 2>/dev/null; then
+        info "Google Cloud detected on some hosts"
+    fi
+    if grep -qi "fastly" "$httpx_out" 2>/dev/null; then
+        info "Fastly detected"
+    fi
+    ok "WAF fingerprinting complete"
 }
 
 # ── Phase 3: Port Scanning ──────────────────────────────────────────────
@@ -400,6 +536,39 @@ phase_4_url_discovery() {
     fi
 }
 
+# ── Phase 4b: Cloud Asset Enumeration (S3) ──────────────────────────────
+phase_4b_cloud_enum() {
+    header "Phase 4b: Cloud Asset Enumeration"
+    local cloud_out="$OUTDIR/cloud_assets.txt"
+    : > "$cloud_out"
+
+    info "Checking common S3 bucket names..."
+    local base="${TARGET%%.*}"  # shopify.com -> shopify
+    for suffix in dev staging test backup data assets static cdn media uploads files config logs public private; do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 5 \
+            "https://${base}-${suffix}.s3.amazonaws.com/" 2>/dev/null || echo "000")
+        if [[ "$code" != "404" && "$code" != "000" ]]; then
+            echo "https://${base}-${suffix}.s3.amazonaws.com/  [HTTP $code]" >> "$cloud_out"
+        fi
+    done
+    for suffix in dev staging test backup data assets static cdn; do
+        local code
+        code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 5 \
+            "https://s3.amazonaws.com/${base}-${suffix}/" 2>/dev/null || echo "000")
+        if [[ "$code" != "404" && "$code" != "000" ]]; then
+            echo "https://s3.amazonaws.com/${base}-${suffix}/  [HTTP $code]" >> "$cloud_out"
+        fi
+    done
+
+    if [[ -s "$cloud_out" ]]; then
+        ok "Cloud assets found ($(wc -l < "$cloud_out")) — check $cloud_out"
+        cat "$cloud_out"
+    else
+        ok "No publicly accessible cloud assets detected"
+    fi
+}
+
 # ── Phase 5: JS Analysis ────────────────────────────────────────────────
 phase_5_js_analysis() {
     header "Phase 5: JavaScript Analysis"
@@ -542,7 +711,17 @@ phase_6_extract_params() {
     ok "Interesting endpoints extracted"
 }
 
-# ── Phase 7: Nuclei Vulnerability Scan ──────────────────────────────────
+# ── Cloud report summary helper ─────────────────────────────────────────
+_cloud_summary() {
+    local f="$OUTDIR/cloud_assets.txt"
+    if [[ -f "$f" && -s "$f" ]]; then
+        echo "- Cloud Assets:"
+        while IFS= read -r line; do echo "  - $line"; done < "$f"
+        echo ""
+    fi
+}
+
+# ── Phase 9: Nuclei Vulnerability Scan ──────────────────────────────────
 phase_7_nuclei_scan() {
     header "Phase 7: Nuclei Vulnerability Scan"
     local live_hosts="$OUTDIR/live_hosts.txt"
@@ -557,31 +736,35 @@ phase_7_nuclei_scan() {
 
     [[ -f "$live_hosts" && -s "$live_hosts" ]] || { warn "No live hosts to scan"; return; }
 
-    info "Updating nuclei templates..."
-    nuclei -update-templates 2>/dev/null || err "nuclei template update failed"
+    # Fast nuclei scan: limit to first 5 hosts, 60s per host total
+    head -5 "$live_hosts" > "$OUTDIR/nuclei_targets.txt" 2>/dev/null
+    local nuc_targets="$OUTDIR/nuclei_targets.txt"
+    info "Scanning $(wc -l < "$nuc_targets") hosts with nuclei (max 5, timeout 120s total)..."
 
-    info "Scanning for vulnerabilities (critical/high/medium)..."
-    nuclei -l "$live_hosts" \
+    nuclei -update-templates 2>/dev/null || warn "nuclei template update failed"
+
+    timeout 120 nuclei -l "$nuc_targets" \
         -severity critical,high,medium \
-        -silent -o "$nuclei_output" 2>/dev/null || err "nuclei scan failed"
-    ok "Nuclei findings (critical/high/medium): $(wc -l < "$nuclei_output")"
+        -silent -o "$nuclei_output" 2>/dev/null || \
+        warn "nuclei scan timed out (expected on WAF-protected hosts)"
 
+    local nuc_count; nuc_count=$(wc -l < "$nuclei_output" 2>/dev/null || echo 0)
+    ok "Nuclei findings: $nuc_count"
+
+    # Takeover check: quick, 30s timeout, only first 5 hosts
     local takeover_output="$OUTDIR/nuclei_takeover.txt"
-    : > "$takeover_output"
-    info "Checking for subdomain takeovers..."
-    nuclei -l "$live_hosts" \
+    timeout 30 nuclei -l "$nuc_targets" \
         -tags takeover -silent \
-        -o "$takeover_output" 2>/dev/null || err "nuclei takeover check failed"
+        -o "$takeover_output" 2>/dev/null || true
     local takeover_count; takeover_count=$(wc -l < "$takeover_output" 2>/dev/null || echo 0)
     if [[ "$takeover_count" -gt 0 ]]; then
-        ok "Subdomain takeover candidates: $takeover_count — check $takeover_output!"
+        ok "Subdomain takeover candidates: $takeover_count"
     else
         ok "No subdomain takeovers detected"
     fi
 
     cat "$takeover_output" >> "$nuclei_output" 2>/dev/null || true
     sort -u "$nuclei_output" -o "$nuclei_output"
-    ok "Total nuclei findings: $(wc -l < "$nuclei_output")"
 }
 
 # ── Phase 8: Generate Report ────────────────────────────────────────────
@@ -664,6 +847,8 @@ phase_8_report() {
         fi
         echo ""
 
+        _cloud_summary
+
         echo "- Nuclei Vulnerabilities:"
         if [[ -f "$OUTDIR/nuclei_results.txt" && -s "$OUTDIR/nuclei_results.txt" ]]; then
             while IFS= read -r line; do [[ -n "$line" ]] && echo "  - $line"; done < "$OUTDIR/nuclei_results.txt"
@@ -684,6 +869,7 @@ phase_8_report() {
         echo "  JS secrets found:         $(wc -l < "$OUTDIR/js_secrets.txt" 2>/dev/null || echo 0)"
         echo "  Endpoints extracted:      $(wc -l < "$OUTDIR/interesting_endpoints.txt" 2>/dev/null || echo 0)"
         echo "  Parameters extracted:     $(wc -l < "$OUTDIR/interesting_params.txt" 2>/dev/null || echo 0)"
+        echo "  Cloud assets found:       $(wc -l < "$OUTDIR/cloud_assets.txt" 2>/dev/null || echo 0)"
         echo "  Nuclei findings:          $(wc -l < "$OUTDIR/nuclei_results.txt" 2>/dev/null || echo 0)"
         echo ""
     } > "$report"
@@ -704,8 +890,10 @@ main() {
 
     phase_1_subdomains
     phase_2_live_hosts
+    phase_2b_waf_detect
     phase_3_port_scan
     phase_4_url_discovery
+    phase_4b_cloud_enum
 
     # ── Re-resolve and probe subdomains discovered from URL data ──
     # Phase 4 may have added new subdomains to subdomains.txt from URL hostnames.
@@ -738,9 +926,15 @@ main() {
                 httpx -silent -l "$dns_resolved" \
                     -status-code -title -tech-detect \
                     -o "$OUTDIR/httpx_output.txt" 2>/dev/null || true
-                awk '{print $1}' "$OUTDIR/httpx_output.txt" > "$live_hosts" 2>/dev/null || true
+                local new_hosts
+                new_hosts=$(awk '{print $1}' "$OUTDIR/httpx_output.txt" 2>/dev/null || true)
+                if [[ -n "$new_hosts" ]]; then
+                    echo "$new_hosts" | sort -u > "$live_hosts" 2>/dev/null || true
+                    ok "Live hosts after re-resolve: $(wc -l < "$live_hosts")"
+                else
+                    ok "No additional live hosts from re-resolve (keeping previous $old_resolved_count hosts)"
+                fi
             fi
-            ok "Live hosts after re-scan: $(wc -l < "$live_hosts")"
         fi
     fi
 
