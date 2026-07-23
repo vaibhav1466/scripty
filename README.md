@@ -1,4 +1,4 @@
-# AutoRecon — Automated Bug Bounty Reconnaissance Pipeline
+# Scripty — Automated Bug Bounty Reconnaissance Pipeline
 
 Turn a domain into a structured recon report in one command.
 
